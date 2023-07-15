@@ -1,1 +1,188 @@
 
+1. kubelet 启动入口
+https://github.com/kubernetes/kubernetes/tree/master/cmd/kubelet/kubelet.go
+
+func main() {
+	command := app.NewKubeletCommand()
+	code := cli.Run(command)
+	os.Exit(code)
+}
+
+https://github.com/kubernetes/kubernetes/tree/master/cmd/kubelet/app/server.go
+
+NewKubeletCommand 生成一个kubelet启动命令，在这个函数中加载了kubelet的flags，config，并返回一个cobra.Command的命令指针。
+
+func NewKubeletCommand() *cobra.Command {
+	cleanFlagSet := pflag.NewFlagSet(componentKubelet, pflag.ContinueOnError)
+	cleanFlagSet.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
+	kubeletFlags := options.NewKubeletFlags()
+
+	kubeletConfig, err := options.NewKubeletConfiguration()
+	// programmer error
+	if err != nil {
+		klog.ErrorS(err, "Failed to create a new kubelet configuration")
+		os.Exit(1)
+	}
+
+	cmd := &cobra.Command{...}
+    kubeletFlags.AddFlags(cleanFlagSet)
+	options.AddKubeletConfigFlags(cleanFlagSet, kubeletConfig)
+	options.AddGlobalFlags(cleanFlagSet)
+	cleanFlagSet.BoolP("help", "h", false, fmt.Sprintf("help for %s", cmd.Name()))
+
+	// ugly, but necessary, because Cobra's default UsageFunc and HelpFunc pollute the flagset with global flags
+	const usageFmt = "Usage:\n  %s\n\nFlags:\n%s"
+	cmd.SetUsageFunc(func(cmd *cobra.Command) error {
+		fmt.Fprintf(cmd.OutOrStderr(), usageFmt, cmd.UseLine(), cleanFlagSet.FlagUsagesWrapped(2))
+		return nil
+	})
+	cmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		fmt.Fprintf(cmd.OutOrStdout(), "%s\n\n"+usageFmt, cmd.Long, cmd.UseLine(), cleanFlagSet.FlagUsagesWrapped(2))
+	})
+
+	return cmd
+}
+
+
+2. 
+
+cmd := &cobra.Command{
+		Use: componentKubelet,
+		Long: `The kubelet is the primary "node agent" that runs on each
+node. It can register the node with the apiserver using one of: the hostname; a flag to
+override the hostname; or specific logic for a cloud provider.
+
+The kubelet works in terms of a PodSpec. A PodSpec is a YAML or JSON object
+that describes a pod. The kubelet takes a set of PodSpecs that are provided through
+various mechanisms (primarily through the apiserver) and ensures that the containers
+described in those PodSpecs are running and healthy. The kubelet doesn't manage
+containers which were not created by Kubernetes.
+
+Other than from an PodSpec from the apiserver, there are two ways that a container
+manifest can be provided to the Kubelet.
+
+File: Path passed as a flag on the command line. Files under this path will be monitored
+periodically for updates. The monitoring period is 20s by default and is configurable
+via a flag.
+
+HTTP endpoint: HTTP endpoint passed as a parameter on the command line. This endpoint
+is checked every 20 seconds (also configurable with a flag).`,
+		// The Kubelet has special flag parsing requirements to enforce flag precedence rules,
+		// so we do all our parsing manually in Run, below.
+		// DisableFlagParsing=true provides the full set of flags passed to the kubelet in the
+		// `args` arg to Run, without Cobra's interference.
+		DisableFlagParsing: true,
+		SilenceUsage:       true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// initial flag parse, since we disable cobra's flag parsing
+			if err := cleanFlagSet.Parse(args); err != nil {
+				return fmt.Errorf("failed to parse kubelet flag: %w", err)
+			}
+
+			// check if there are non-flag arguments in the command line
+			cmds := cleanFlagSet.Args()
+			if len(cmds) > 0 {
+				return fmt.Errorf("unknown command %+s", cmds[0])
+			}
+
+			// short-circuit on help
+			help, err := cleanFlagSet.GetBool("help")
+			if err != nil {
+				return errors.New(`"help" flag is non-bool, programmer error, please correct`)
+			}
+			if help {
+				return cmd.Help()
+			}
+
+			// short-circuit on verflag
+			verflag.PrintAndExitIfRequested()
+
+			// set feature gates from initial flags-based config
+			if err := utilfeature.DefaultMutableFeatureGate.SetFromMap(kubeletConfig.FeatureGates); err != nil {
+				return fmt.Errorf("failed to set feature gates from initial flags-based config: %w", err)
+			}
+
+			// validate the initial KubeletFlags
+			if err := options.ValidateKubeletFlags(kubeletFlags); err != nil {
+				return fmt.Errorf("failed to validate kubelet flags: %w", err)
+			}
+
+			if cleanFlagSet.Changed("pod-infra-container-image") {
+				klog.InfoS("--pod-infra-container-image will not be pruned by the image garbage collector in kubelet and should also be set in the remote runtime")
+			}
+
+			// load kubelet config file, if provided
+			if configFile := kubeletFlags.KubeletConfigFile; len(configFile) > 0 {
+				kubeletConfig, err = loadConfigFile(configFile)
+				if err != nil {
+					return fmt.Errorf("failed to load kubelet config file, error: %w, path: %s", err, configFile)
+				}
+				// We must enforce flag precedence by re-parsing the command line into the new object.
+				// This is necessary to preserve backwards-compatibility across binary upgrades.
+				// See issue #56171 for more details.
+				if err := kubeletConfigFlagPrecedence(kubeletConfig, args); err != nil {
+					return fmt.Errorf("failed to precedence kubeletConfigFlag: %w", err)
+				}
+				// update feature gates based on new config
+				if err := utilfeature.DefaultMutableFeatureGate.SetFromMap(kubeletConfig.FeatureGates); err != nil {
+					return fmt.Errorf("failed to set feature gates from initial flags-based config: %w", err)
+				}
+			}
+
+			// Config and flags parsed, now we can initialize logging.
+			logs.InitLogs()
+			if err := logsapi.ValidateAndApplyAsField(&kubeletConfig.Logging, utilfeature.DefaultFeatureGate, field.NewPath("logging")); err != nil {
+				return fmt.Errorf("initialize logging: %v", err)
+			}
+			cliflag.PrintFlags(cleanFlagSet)
+
+			// We always validate the local configuration (command line + config file).
+			// This is the default "last-known-good" config for dynamic config, and must always remain valid.
+			if err := kubeletconfigvalidation.ValidateKubeletConfiguration(kubeletConfig, utilfeature.DefaultFeatureGate); err != nil {
+				return fmt.Errorf("failed to validate kubelet configuration, error: %w, path: %s", err, kubeletConfig)
+			}
+
+			if (kubeletConfig.KubeletCgroups != "" && kubeletConfig.KubeReservedCgroup != "") && (strings.Index(kubeletConfig.KubeletCgroups, kubeletConfig.KubeReservedCgroup) != 0) {
+				klog.InfoS("unsupported configuration:KubeletCgroups is not within KubeReservedCgroup")
+			}
+
+			// construct a KubeletServer from kubeletFlags and kubeletConfig
+			kubeletServer := &options.KubeletServer{
+				KubeletFlags:         *kubeletFlags,
+				KubeletConfiguration: *kubeletConfig,
+			}
+
+			// use kubeletServer to construct the default KubeletDeps
+			kubeletDeps, err := UnsecuredDependencies(kubeletServer, utilfeature.DefaultFeatureGate)
+			if err != nil {
+				return fmt.Errorf("failed to construct kubelet dependencies: %w", err)
+			}
+
+			if err := checkPermissions(); err != nil {
+				klog.ErrorS(err, "kubelet running with insufficient permissions")
+			}
+
+			// make the kubelet's config safe for logging
+			config := kubeletServer.KubeletConfiguration.DeepCopy()
+			for k := range config.StaticPodURLHeader {
+				config.StaticPodURLHeader[k] = []string{"<masked>"}
+			}
+			// log the kubelet's config for inspection
+			klog.V(5).InfoS("KubeletConfiguration", "configuration", config)
+
+			// set up signal context for kubelet shutdown
+			ctx := genericapiserver.SetupSignalContext()
+
+			utilfeature.DefaultMutableFeatureGate.AddMetrics()
+			// run the kubelet
+			return Run(ctx, kubeletServer, kubeletDeps, utilfeature.DefaultFeatureGate)
+		},
+	}
+
+
+3. kubelet 首先加载flags和config ，并验证有效性，生成一个kubeletServer。
+
+4. 使用 kubeletServer 构造默认的 KubeletDeps。
+
+5. 生成进程context，添加指标，执行run函数
+
