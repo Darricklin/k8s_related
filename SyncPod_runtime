@@ -1,0 +1,236 @@
+容器运行时的sync_pod处理pod的实际创建流程
+
+https://github.com/kubernetes/kubernetes/tree/master/pkg/kubelet/kuberuntime/kuberuntime_manager.go
+接收pod,podStatus......返回一个pod同步结果
+func (m *kubeGenericRuntimeManager) SyncPod(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus,
+	 pullSecrets []v1.Secret, backOff *flowcontrol.Backoff) (result kubecontainer.PodSyncResult){}
+
+
+SyncPod syncs the running pod into the desired pod by executing following steps:
+SyncPod 通过执行以下步骤将正在运行的 pod 同步到所需的 pod：
+1. Compute sandbox and container changes.
+计算沙盒和容器变化,查看pod spec 是否变化，并返回变化内容
+2. Kill pod sandbox if necessary.
+杀死pod,如果沙盒变化
+3. Kill any containers that should not be running.
+杀死pod内的容器,如果沙盒变化
+4. Create sandbox if necessary.
+创建沙盒
+5. Create ephemeral containers.
+启动临时容器
+6. Create init containers.
+启动init 容器
+7. Create normal containers.
+启动业务容器
+
+
+
+
+1. // Step 1: Compute sandbox and container changes.
+	//computePodActions checks whether the pod spec has changed and returns the changes if true.
+	podContainerChanges := m.computePodActions(pod, podStatus)
+	klog.V(3).InfoS("computePodActions got for pod", "podActions", podContainerChanges, "pod", klog.KObj(pod))
+	if podContainerChanges.CreateSandbox {
+		ref, err := ref.GetReference(legacyscheme.Scheme, pod)
+		if err != nil {
+			klog.ErrorS(err, "Couldn't make a ref to pod", "pod", klog.KObj(pod))
+		}
+		if podContainerChanges.SandboxID != "" {
+			m.recorder.Eventf(ref, v1.EventTypeNormal, events.SandboxChanged, "Pod sandbox changed, it will be killed and re-created.")
+		} else {
+			klog.V(4).InfoS("SyncPod received new pod, will create a sandbox for it", "pod", klog.KObj(pod))
+		}
+	}
+
+	computePodActions调用PodSandboxChanged,检查沙盒是否变化需要重建,主要包括1.沙盒存在且不是最新的;2.沙盒不存在3.network namespace变化;
+	4.非主机网络,且没有ip地址
+	// computePodActions checks whether the pod spec has changed and returns the changes if true.
+	func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *kubecontainer.PodStatus) podActions {
+	klog.V(5).InfoS("Syncing Pod", "pod", klog.KObj(pod))
+
+	createPodSandbox, attempt, sandboxID := runtimeutil.PodSandboxChanged(pod, podStatus)
+	changes := podActions{
+		KillPod:           createPodSandbox,
+		CreateSandbox:     createPodSandbox,
+		SandboxID:         sandboxID,
+		Attempt:           attempt,
+		ContainersToStart: []int{},
+		ContainersToKill:  make(map[kubecontainer.ContainerID]containerToKillInfo),
+	}
+
+	// If we need to (re-)create the pod sandbox, everything will need to be
+	// killed and recreated, and init containers should be purged.
+	if createPodSandbox {}
+
+	}
+
+
+2.  // Step 2: Kill the pod if the sandbox has changed.
+	if podContainerChanges.KillPod {
+		if podContainerChanges.CreateSandbox {
+			klog.V(4).InfoS("Stopping PodSandbox for pod, will start new one", "pod", klog.KObj(pod))
+		} else {
+			klog.V(4).InfoS("Stopping PodSandbox for pod, because all other containers are dead", "pod", klog.KObj(pod))
+		}
+
+		killResult := m.killPodWithSyncResult(ctx, pod, kubecontainer.ConvertPodStatusToRunningPod(m.runtimeName, podStatus), nil)
+		result.AddPodSyncResult(killResult)
+		if killResult.Error() != nil {
+			klog.ErrorS(killResult.Error(), "killPodWithSyncResult failed")
+			return
+		}
+
+		if podContainerChanges.CreateSandbox {
+			m.purgeInitContainers(ctx, pod, podStatus)
+		}
+
+3. // Step 3: kill any running containers in this pod which are not to keep.
+	for containerID, containerInfo := range podContainerChanges.ContainersToKill {
+		klog.V(3).InfoS("Killing unwanted container for pod", "containerName", containerInfo.name, "containerID", containerID, "pod", klog.KObj(pod))
+		killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, containerInfo.name)
+		result.AddSyncResult(killContainerResult)
+		if err := m.killContainer(ctx, pod, containerID, containerInfo.name, containerInfo.message, containerInfo.reason, nil); err != nil {
+			killContainerResult.Fail(kubecontainer.ErrKillContainer, err.Error())
+			klog.ErrorS(err, "killContainer for pod failed", "containerName", containerInfo.name, "containerID", containerID, "pod", klog.KObj(pod))
+			return
+		}
+	}
+
+4. // Step 4: Create a sandbox for the pod if necessary.
+podSandboxID := podContainerChanges.SandboxID
+if podContainerChanges.CreateSandbox {
+	var msg string
+	var err error
+
+	klog.V(4).InfoS("Creating PodSandbox for pod", "pod", klog.KObj(pod))
+	metrics.StartedPodsTotal.Inc()
+	createSandboxResult := kubecontainer.NewSyncResult(kubecontainer.CreatePodSandbox, format.Pod(pod))
+	result.AddSyncResult(createSandboxResult)
+
+	// ConvertPodSysctlsVariableToDotsSeparator converts sysctl variable
+	// in the Pod.Spec.SecurityContext.Sysctls slice into a dot as a separator.
+	// runc uses the dot as the separator to verify whether the sysctl variable
+	// is correct in a separate namespace, so when using the slash as the sysctl
+	// variable separator, runc returns an error: "sysctl is not in a separate kernel namespace"
+	// and the podSandBox cannot be successfully created. Therefore, before calling runc,
+	// we need to convert the sysctl variable, the dot is used as a separator to separate the kernel namespace.
+	// When runc supports slash as sysctl separator, this function can no longer be used.
+	sysctl.ConvertPodSysctlsVariableToDotsSeparator(pod.Spec.SecurityContext)
+
+	// Prepare resources allocated by the Dynammic Resource Allocation feature for the pod
+	if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+		if m.runtimeHelper.PrepareDynamicResources(pod) != nil {
+			return
+		}
+	}
+
+	podSandboxID, msg, err = m.createPodSandbox(ctx, pod, podContainerChanges.Attempt)
+	if err != nil {
+		// createPodSandbox can return an error from CNI, CSI,
+		// or CRI if the Pod has been deleted while the POD is
+		// being created. If the pod has been deleted then it's
+		// not a real error.
+		//
+		// SyncPod can still be running when we get here, which
+		// means the PodWorker has not acked the deletion.
+		if m.podStateProvider.IsPodTerminationRequested(pod.UID) {
+			klog.V(4).InfoS("Pod was deleted and sandbox failed to be created", "pod", klog.KObj(pod), "podUID", pod.UID)
+			return
+		}
+		metrics.StartedPodsErrorsTotal.Inc()
+		createSandboxResult.Fail(kubecontainer.ErrCreatePodSandbox, msg)
+		klog.ErrorS(err, "CreatePodSandbox for pod failed", "pod", klog.KObj(pod))
+		ref, referr := ref.GetReference(legacyscheme.Scheme, pod)
+		if referr != nil {
+			klog.ErrorS(referr, "Couldn't make a ref to pod", "pod", klog.KObj(pod))
+		}
+		m.recorder.Eventf(ref, v1.EventTypeWarning, events.FailedCreatePodSandBox, "Failed to create pod sandbox: %v", err)
+		return
+	}
+
+
+	定义start函数,startContainer调用remote runtime
+	// Helper containing boilerplate common to starting all types of containers.
+	// typeName is a description used to describe this type of container in log messages,
+	// currently: "container", "init container" or "ephemeral container"
+	// metricLabel is the label used to describe this type of container in monitoring metrics.
+	// currently: "container", "init_container" or "ephemeral_container"
+	start := func(ctx context.Context, typeName, metricLabel string, spec *startSpec) error {
+		startContainerResult := kubecontainer.NewSyncResult(kubecontainer.StartContainer, spec.container.Name)
+		result.AddSyncResult(startContainerResult)
+
+		isInBackOff, msg, err := m.doBackOff(pod, spec.container, podStatus, backOff)
+		if isInBackOff {
+			startContainerResult.Fail(err, msg)
+			klog.V(4).InfoS("Backing Off restarting container in pod", "containerType", typeName, "container", spec.container, "pod", klog.KObj(pod))
+			return err
+		}
+
+		metrics.StartedContainersTotal.WithLabelValues(metricLabel).Inc()
+		if sc.HasWindowsHostProcessRequest(pod, spec.container) {
+			metrics.StartedHostProcessContainersTotal.WithLabelValues(metricLabel).Inc()
+		}
+		klog.V(4).InfoS("Creating container in pod", "containerType", typeName, "container", spec.container, "pod", klog.KObj(pod))
+		// NOTE (aramase) podIPs are populated for single stack and dual stack clusters. Send only podIPs.
+		if msg, err := m.startContainer(ctx, podSandboxID, podSandboxConfig, spec, pod, podStatus, pullSecrets, podIP, podIPs); err != nil {
+			// startContainer() returns well-defined error codes that have reasonable cardinality for metrics and are
+			// useful to cluster administrators to distinguish "server errors" from "user errors".
+			metrics.StartedContainersErrorsTotal.WithLabelValues(metricLabel, err.Error()).Inc()
+			if sc.HasWindowsHostProcessRequest(pod, spec.container) {
+				metrics.StartedHostProcessContainersErrorsTotal.WithLabelValues(metricLabel, err.Error()).Inc()
+			}
+			startContainerResult.Fail(err, msg)
+			// known errors that are logged in other places are logged at higher levels here to avoid
+			// repetitive log spam
+			switch {
+			case err == images.ErrImagePullBackOff:
+				klog.V(3).InfoS("Container start failed in pod", "containerType", typeName, "container", spec.container, "pod", klog.KObj(pod), "containerMessage", msg, "err", err)
+			default:
+				utilruntime.HandleError(fmt.Errorf("%v %+v start failed in pod %v: %v: %s", typeName, spec.container, format.Pod(pod), err, msg))
+			}
+			return err
+		}
+
+		return nil
+	}
+
+	startContainer()主要执行创建容器流程,拉取镜像,创建容器,启动容器,通过客户端invoke rpc调用运行时。
+	// startContainer starts a container and returns a message indicates why it is failed on error.
+// It starts the container through the following steps:
+// * pull the image
+// * create the container
+// * start the container
+// * run the post start lifecycle hooks (if applicable)
+func (m *kubeGenericRuntimeManager) startContainer(ctx context.Context, podSandboxID string, podSandboxConfig *runtimeapi.PodSandboxConfig, spec *startSpec, pod *v1.Pod, podStatus
+	 *kubecontainer.PodStatus, pullSecrets []v1.Secret, podIP string, podIPs []string) (string, error) {}
+
+
+5. // Step 5: start ephemeral containers
+// These are started "prior" to init containers to allow running ephemeral containers even when there
+// are errors starting an init container. In practice init containers will start first since ephemeral
+// containers cannot be specified on pod creation.
+for _, idx := range podContainerChanges.EphemeralContainersToStart {
+	start(ctx, "ephemeral container", metrics.EphemeralContainer, ephemeralContainerStartSpec(&pod.Spec.EphemeralContainers[idx]))
+}
+
+6. // Step 6: start the init container.
+if container := podContainerChanges.NextInitContainerToStart; container != nil {
+	// Start the next init container.
+	if err := start(ctx, "init container", metrics.InitContainer, containerStartSpec(container)); err != nil {
+		return
+	}
+
+	// Successfully started the container; clear the entry in the failure
+	klog.V(4).InfoS("Completed init container for pod", "containerName", container.Name, "pod", klog.KObj(pod))
+}
+
+
+7. // Step 7: start containers in podContainerChanges.ContainersToStart.
+for _, idx := range podContainerChanges.ContainersToStart {
+	start(ctx, "container", metrics.Container, containerStartSpec(&pod.Spec.Containers[idx]))
+}
+
+
+
+
+

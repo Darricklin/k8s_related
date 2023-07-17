@@ -343,6 +343,10 @@ func createAndInitKubelet(kubeServer *options.KubeletServer,
 
 	k, err = kubelet.NewMainKubelet(&kubeServer.KubeletConfiguration,......)
 
+
+
+https://github.com/kubernetes/kubernetes/tree/master/pkg/kubelet/kubelet.go
+
 NewMainKubelet实例化一个kubelet实例以及内部所需的所有模块。
 1. 创建node informer，同步node信息到api server
 2. 创建service informer，监听service事件
@@ -419,4 +423,90 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,......)(
 		return nil, err
 	}
 	klet.runtimeCache = runtimeCache
+}
+
+
+startKubelet函数调用kublet Run函数，加载插件，更新runtimeState，并运行服务。
+// process pods and exit.
+	if runOnce {
+		if _, err := k.RunOnce(podCfg.Updates()); err != nil {
+			return fmt.Errorf("runonce failed: %w", err)
+		}
+		klog.InfoS("Started kubelet as runonce")
+	} else {
+		startKubelet(k, podCfg, &kubeServer.KubeletConfiguration, kubeDeps, kubeServer.EnableServer)
+		klog.InfoS("Started kubelet")
+	}
+
+func startKubelet(k kubelet.Bootstrap, podCfg *config.PodConfig, kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *kubelet.Dependencies, enableServer bool) {
+	// start the kubelet
+	go k.Run(podCfg.Updates())
+
+	// start the kubelet server
+	if enableServer {
+		go k.ListenAndServe(kubeCfg, kubeDeps.TLSOptions, kubeDeps.Auth, kubeDeps.TracerProvider)
+	}
+	if kubeCfg.ReadOnlyPort > 0 {
+		go k.ListenAndServeReadOnly(netutils.ParseIPSloppy(kubeCfg.Address), uint(kubeCfg.ReadOnlyPort))
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletPodResources) {
+		go k.ListenAndServePodResources()
+	}
+}
+
+
+
+kubelet 的Run函数,
+
+// Run starts the kubelet reacting to config updates
+func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
+    持续更新运行时状态
+    go wait.Until(kl.updateRuntimeUp, 5*time.Second, wait.NeverStop)
+
+}
+
+// updateRuntimeUp calls the container runtime status callback, initializing
+// the runtime dependent modules when the container runtime first comes up,
+// and returns an error if the status check fails.  If the status check is OK,
+// update the container runtime uptime in the kubelet runtimeState.
+// 网络插件状态和运行时状态
+func (kl *Kubelet) updateRuntimeUp() {
+networkReady := s.GetRuntimeCondition(kubecontainer.NetworkReady)
+	if networkReady == nil || !networkReady.Status {
+		klogErrorS(nil, "Container runtime network not ready", "networkReady", networkReady)
+		kl.runtimeState.setNetworkState(fmt.Errorf("container runtime network not ready: %v", networkReady))
+	} else {
+		// Set nil if the container runtime network is ready.
+		kl.runtimeState.setNetworkState(nil)
+	}
+	// information in RuntimeReady condition will be propagated to NodeReady condition.
+	runtimeReady := s.GetRuntimeCondition(kubecontainer.RuntimeReady)
+	// If RuntimeReady is not set or is false, report an error.
+	if runtimeReady == nil || !runtimeReady.Status {
+		klogErrorS(nil, "Container runtime not ready", "runtimeReady", runtimeReady)
+		kl.runtimeState.setRuntimeState(fmt.Errorf("container runtime not ready: %v", runtimeReady))
+		return
+	}
+	kl.runtimeState.setRuntimeState(nil)
+	kl.oneTimeInitializer.Do(kl.initializeRuntimeDependentModules)
+	kl.runtimeState.setRuntimeSync(kl.clock.Now())
+
+}
+
+
+加载了存储和网络插件
+// initializeRuntimeDependentModules will initialize internal modules that require the container runtime to be up.
+func (kl *Kubelet) initializeRuntimeDependentModules() {
+    // Adding Registration Callback function for CSI Driver
+	kl.pluginManager.AddHandler(pluginwatcherapi.CSIPlugin, plugincache.PluginHandler(csi.PluginHandler))
+	// Adding Registration Callback function for DRA Plugin
+	if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+		kl.pluginManager.AddHandler(pluginwatcherapi.DRAPlugin, plugincache.PluginHandler(draplugin.NewRegistrationHandler()))
+	}
+	// Adding Registration Callback function for Device Manager
+	kl.pluginManager.AddHandler(pluginwatcherapi.DevicePlugin, kl.containerManager.GetPluginRegistrationHandler())
+
+	// Start the plugin manager
+	klog.V(4).InfoS("Starting plugin manager")
+	go kl.pluginManager.Run(kl.sourcesReady, wait.NeverStop)
 }
