@@ -1,3 +1,14 @@
+kubelet服务启动的主要流程
+1.cmd 创建一个启动命令
+2.启动命令内部的run函数，先检查flags和config
+3.使用flags和config生成kubelet server，并生成KubeletDeps。
+4.初始化kubelet配置，加载apis/config/default中的默认配置
+5. 判断kubelet是否为standaloneMode（独立运行模式），如果是就设置kubeclient为nil，无需向apiserver报送信息。否则创建kubeclient
+6. 初始化运行时manager和运行时服务，这一步需要在启动kubelet之前
+7. runkubelet，配置node监听，报送node信息，配置service监听，pod监听，初始化pod workers，初始化syncPod,syncTerminatingPod，syncTerminatedPod三个函数处理pod时间。
+
+
+
 
 1. kubelet 启动入口
 https://github.com/kubernetes/kubernetes/tree/master/cmd/kubelet/kubelet.go
@@ -186,3 +197,226 @@ is checked every 20 seconds (also configurable with a flag).`,
 
 5. 生成进程context，添加指标，执行run函数
 
+6. Run函数调用run函数，run函数是kubelet的最终启动函数。
+
+func Run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Dependencies, featureGate featuregate.FeatureGate) error {
+	// To help debugging, immediately log version
+	klog.InfoS("Kubelet version", "kubeletVersion", version.Get())
+
+	klog.InfoS("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
+
+	if err := initForOS(s.KubeletFlags.WindowsService, s.KubeletFlags.WindowsPriorityClass); err != nil {
+		return fmt.Errorf("failed OS init: %w", err)
+	}
+	if err := run(ctx, s, kubeDeps, featureGate); err != nil {
+		return fmt.Errorf("failed to run Kubelet: %w", err)
+	}
+	return nil
+}
+
+func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Dependencies, featureGate featuregate.FeatureGate) (err error) {
+	// Set global feature gates based on the value on the initial KubeletServer
+	err = utilfeature.DefaultMutableFeatureGate.SetFromMap(s.KubeletConfiguration.FeatureGates)
+	if err != nil {
+		return err
+	}
+	// validate the initial KubeletServer (we set feature gates first, because this validation depends on feature gates)
+	if err := options.ValidateKubeletServer(s); err != nil {
+		return err
+	}
+    
+    ......
+
+	// Register current configuration with /configz endpoint
+	err = initConfigz(&s.KubeletConfiguration)
+	if err != nil {
+		klog.ErrorS(err, "Failed to register kubelet configuration with configz")
+	}
+    ......
+
+7. 初始化kubelet配置。
+initConfigz() 调用setConfigz() 调用 kubeletscheme.NewSchemeAndCodecs()生成 scheme，scheme进行config类型转换，并给cz赋值。
+
+func setConfigz(cz *configz.Config, kc *kubeletconfiginternal.KubeletConfiguration) error {
+	scheme, _, err := kubeletscheme.NewSchemeAndCodecs()
+	if err != nil {
+		return err
+	}
+	versioned := kubeletconfigv1beta1.KubeletConfiguration{}
+	if err := scheme.Convert(kc, &versioned, nil); err != nil {
+		return err
+	}
+	cz.Set(versioned)
+	return nil
+}
+
+kubeletscheme，引用kubeletscheme "k8s.io/kubernetes/pkg/kubelet/apis/config/scheme"这个包，scheme引用了kubeletconfigv1beta1 "k8s.io/kubernetes/pkg/kubelet/apis/config/v1beta1" 这个包的register文件，register文件init()函数注册默认kubelet参数，
+
+func init() {
+	// We only register manually written functions here. The registration of the
+	// generated functions takes place in the generated files. The separation
+	// makes the code compile even when the generated files are missing.
+	localSchemeBuilder.Register(addDefaultingFuncs)
+}
+
+8. 判断是否为standaloneMode模式，是否生成kubelet client
+
+switch {
+	case standaloneMode:
+		kubeDeps.KubeClient = nil
+		kubeDeps.EventClient = nil
+		kubeDeps.HeartbeatClient = nil
+		klog.InfoS("Standalone mode, no API client")
+
+	case kubeDeps.KubeClient == nil, kubeDeps.EventClient == nil, kubeDeps.HeartbeatClient == nil:
+		clientConfig, onHeartbeatFailure, err := buildKubeletClientConfig(ctx, s, kubeDeps.TracerProvider, nodeName)
+		if err != nil {
+			return err
+		}
+		if onHeartbeatFailure == nil {
+			return errors.New("onHeartbeatFailure must be a valid function other than nil")
+		}
+		kubeDeps.OnHeartbeatFailure = onHeartbeatFailure
+
+		kubeDeps.KubeClient, err = clientset.NewForConfig(clientConfig)
+
+9. 初始化事件接收队列。
+
+// Setup event recorder if required.
+	makeEventRecorder(kubeDeps, nodeName)
+
+
+10. 初始化containerManager，
+
+if kubeDeps.ContainerManager == nil {
+    kubeDeps.ContainerManager, err = cm.NewContainerManager(......)
+}
+
+11. 初始化运行时服务，在运行kubelet之前。
+err = kubelet.PreInitRuntimeService(&s.KubeletConfiguration, kubeDeps)
+// PreInitRuntimeService will init runtime service before RunKubelet.
+
+func PreInitRuntimeService(kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *Dependencies) error {
+	remoteImageEndpoint := kubeCfg.ImageServiceEndpoint
+	if remoteImageEndpoint == "" && kubeCfg.ContainerRuntimeEndpoint != "" {
+		remoteImageEndpoint = kubeCfg.ContainerRuntimeEndpoint
+	}
+	var err error
+	if kubeDeps.RemoteRuntimeService, err = remote.NewRemoteRuntimeService(kubeCfg.ContainerRuntimeEndpoint, kubeCfg.RuntimeRequestTimeout.Duration, kubeDeps.TracerProvider); err != nil {
+		return err
+	}
+	if kubeDeps.RemoteImageService, err = remote.NewRemoteImageService(remoteImageEndpoint, kubeCfg.RuntimeRequestTimeout.Duration, kubeDeps.TracerProvider); err != nil {
+		return err
+	}
+
+	kubeDeps.useLegacyCadvisorStats = cadvisor.UsingLegacyCadvisorStats(kubeCfg.ContainerRuntimeEndpoint)
+
+	return nil
+}
+12. 运行kubelet服务。
+
+	if err := RunKubelet(s, kubeDeps, s.RunOnce); err != nil {
+		return err
+	}
+
+func RunKubelet(kubeServer *options.KubeletServer, kubeDeps *kubelet.Dependencies, runOnce bool) error {
+    ......
+    k, err := createAndInitKubelet(kubeServer,
+		kubeDeps,
+		hostname,
+		hostnameOverridden,
+		nodeName,
+		nodeIPs)
+    
+}
+
+createAndInitKubelet调用kubelet的NewMainKubelet()函数，创建一个*kubelet对象。
+
+func createAndInitKubelet(kubeServer *options.KubeletServer,
+	kubeDeps *kubelet.Dependencies,
+	hostname string,
+	hostnameOverridden bool,
+	nodeName types.NodeName,
+	nodeIPs []net.IP) (k kubelet.Bootstrap, err error) {
+	// TODO: block until all sources have delivered at least one update to the channel, or break the sync loop
+	// up into "per source" synchronizations
+
+	k, err = kubelet.NewMainKubelet(&kubeServer.KubeletConfiguration,......)
+
+NewMainKubelet实例化一个kubelet实例以及内部所需的所有模块。
+1. 创建node informer，同步node信息到api server
+2. 创建service informer，监听service事件
+3. 创建kubelet实例，
+4. 创建secretManager，configMapManager，livenessManager，readinessManager，startupManager,podManager,statusManager
+5. 创建pod manager，创建pod Workers，内含关键函数syncPod，syncTerminatingPod，syncTerminatedPod，由容器运行时实现具体逻辑。
+6. 生成容器运行时manager和cache，赋值给kubelet
+func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,......)(*Kubelet, error) {
+    // 1 .如果 kubeClient == nil，我们以独立模式运行（即没有 API 服务器）,如果不为零，我们将作为集群的一部分运行，并且应该与 API 同步
+    if kubeDeps.KubeClient != nil {
+		kubeInformers := informers.NewSharedInformerFactoryWithOptions(kubeDeps.KubeClient, 0, informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.Set{metav1.ObjectNameField: string(nodeName)}.String()
+		}))
+		nodeLister = kubeInformers.Core().V1().Nodes().Lister()
+		nodeHasSynced = func() bool {
+			return kubeInformers.Core().V1().Nodes().Informer().HasSynced()
+		}
+		kubeInformers.Start(wait.NeverStop)
+		klog.InfoS("Attempting to sync node with API server")
+	} else {
+		// we don't have a client to sync!
+		nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		nodeLister = corelisters.NewNodeLister(nodeIndexer)
+		nodeHasSynced = func() bool { return true }
+		klog.InfoS("Kubelet is running in standalone mode, will skip API server sync")
+	}
+    // 2. 创建service informer，监听service事件
+    var serviceLister corelisters.ServiceLister
+	var serviceHasSynced cache.InformerSynced
+	if kubeDeps.KubeClient != nil {
+		kubeInformers := informers.NewSharedInformerFactory(kubeDeps.KubeClient, 0)
+		serviceLister = kubeInformers.Core().V1().Services().Lister()
+		serviceHasSynced = kubeInformers.Core().V1().Services().Informer().HasSynced
+		kubeInformers.Start(wait.NeverStop)
+	} else {
+		serviceIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+		serviceLister = corelisters.NewServiceLister(serviceIndexer)
+		serviceHasSynced = func() bool { return true }
+	}
+    // 3. 创建kubelet实例，
+    klet := &Kubelet{
+		hostname:                                hostname,
+		hostnameOverridden:                      hostnameOverridden,
+        ......}
+    // 4. 创建secretManager，configMapManager，livenessManager，readinessManager，startupManager
+    var secretManager secret.Manager
+	var configMapManager configmap.Manager
+    ......
+    klet.livenessManager = proberesults.NewManager()
+	klet.readinessManager = proberesults.NewManager()
+	klet.startupManager = proberesults.NewManager()
+
+    // 5. 创建pod manager，创建pod Workers，内含关键函数syncPod，最终回调容器运行SyncPod时实现具体逻辑。
+    klet.podWorkers = newPodWorkers(
+		klet.syncPod,
+		klet.syncTerminatingPod,
+		klet.syncTerminatedPod,
+
+		kubeDeps.Recorder,
+		klet.workQueue,
+		klet.resyncInterval,
+		backOffPeriod,
+		klet.podCache,
+	)
+    // 6. 生成容器运行时manager和cache，赋值给kubelet
+    runtime, err := kuberuntime.NewKubeGenericRuntimeManager(
+		kubecontainer.FilterEventRecorder(kubeDeps.Recorder),......)
+    klet.containerRuntime = runtime
+	klet.streamingRuntime = runtime
+	klet.runner = runtime
+
+	runtimeCache, err := kubecontainer.NewRuntimeCache(klet.containerRuntime)
+	if err != nil {
+		return nil, err
+	}
+	klet.runtimeCache = runtimeCache
+}
