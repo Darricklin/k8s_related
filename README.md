@@ -1,1 +1,1 @@
-# k8s_related
+主要记录了1.27版本kubelet源码的启动过程，以及过程中的核心逻辑。包括配置加载，remoteruntime的初始化，kubelet启动时独立进程和集群进程的处理，cni，csi插件的加载，syncPod等核心逻辑。
