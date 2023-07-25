@@ -1,0 +1,22 @@
+k8s api-server 架构解析
+
+API Server 架构从上到下可以分为四层
+1. API层:主要以rest方式提供各种API接口,除了有k8s资源对象的curd和watch等主要api,还有健康检查、ui、日志、性能指标等运维监控相关的API.
+2. 访问控制层:当客户端访问API接口时,访问控制层负责对客户身份鉴权,验明用户身份,核准用户对k8s资源的访问权限,然后根据配置的各种资源访问
+    许可逻辑(admission control),判断是否允许访问。
+3. 注册表层:k8s把所有资源都保留在注册表中,针对注册表中的各种资源都定义了资源类型，如何创建资源，如何转换资源的不同版本，以及如何将资源编码
+    解码成json或者protoBuf格式进行存储
+4. Etcd数据库:用于持久化存储k8s资源对象的kv数据库,etcd的watch api接口对于api server至关重要,因为通过这个接口,api server创新性的设计了
+    list-watch这种高性能的资源对象实现同步机制,使得k8s可以管理超大规模的集群,及时响应和快速处理集群中的各种事件。
+
+https://blog.csdn.net/qq_43762191/article/details/125095550
+
+https://img-blog.csdnimg.cn/04ed85e927994a549ca9213230c28b94.png
+
+
+
+创建pod list-watch 流程
+kubectl: 用户通过kubectl创建一个deployment/statefulset,副本集。
+kube-controller-manager: 管理spec等各种资源的controller,并负责向api-server watch 资源变化,监听到一个副本集创建,调用api-server创建对应数量的pod
+kube-scheduler: watch 全量pod,并根据一定的调度规则,调用api-server修改pod的node信息
+kubelet: 各个节点的kubelet watch本节点的pod,通过runtime manager调用docker/containerd,拉起容器,配置网络,更新pod状态。
