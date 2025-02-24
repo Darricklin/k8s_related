@@ -119,7 +119,8 @@ is checked every 20 seconds (also configurable with a flag).`,
 			}
 
 			if cleanFlagSet.Changed("pod-infra-container-image") {
-				klog.InfoS("--pod-infra-container-image will not be pruned by the image garbage collector in kubelet and should also be set in the remote runtime")
+				klog.InfoS("--pod-infra-container-image will not be pruned by the image garbage collector in kubelet
+and should also be set in the remote runtime")
 			}
 
 			// load kubelet config file, if provided
@@ -153,7 +154,8 @@ is checked every 20 seconds (also configurable with a flag).`,
 				return fmt.Errorf("failed to validate kubelet configuration, error: %w, path: %s", err, kubeletConfig)
 			}
 
-			if (kubeletConfig.KubeletCgroups != "" && kubeletConfig.KubeReservedCgroup != "") && (strings.Index(kubeletConfig.KubeletCgroups, kubeletConfig.KubeReservedCgroup) != 0) {
+			if (kubeletConfig.KubeletCgroups != "" && kubeletConfig.KubeReservedCgroup != "") && (strings.Index(kubeletConfig.KubeletCgroups, 
+kubeletConfig.KubeReservedCgroup) != 0) {
 				klog.InfoS("unsupported configuration:KubeletCgroups is not within KubeReservedCgroup")
 			}
 
@@ -250,7 +252,8 @@ func setConfigz(cz *configz.Config, kc *kubeletconfiginternal.KubeletConfigurati
 	return nil
 }
 
-kubeletscheme，引用kubeletscheme "k8s.io/kubernetes/pkg/kubelet/apis/config/scheme"这个包，scheme引用了kubeletconfigv1beta1 "k8s.io/kubernetes/pkg/kubelet/apis/config/v1beta1" 这个包的register文件，register文件init()函数注册默认kubelet参数，
+kubeletscheme，引用kubeletscheme "k8s.io/kubernetes/pkg/kubelet/apis/config/scheme"这个包，scheme引用了kubeletconfigv1beta1 
+"k8s.io/kubernetes/pkg/kubelet/apis/config/v1beta1" 这个包的register文件，register文件init()函数注册默认kubelet参数，
 
 func init() {
 	// We only register manually written functions here. The registration of the
@@ -302,10 +305,12 @@ func PreInitRuntimeService(kubeCfg *kubeletconfiginternal.KubeletConfiguration, 
 		remoteImageEndpoint = kubeCfg.ContainerRuntimeEndpoint
 	}
 	var err error
-	if kubeDeps.RemoteRuntimeService, err = remote.NewRemoteRuntimeService(kubeCfg.ContainerRuntimeEndpoint, kubeCfg.RuntimeRequestTimeout.Duration, kubeDeps.TracerProvider); err != nil {
+	if kubeDeps.RemoteRuntimeService, err = remote.NewRemoteRuntimeService(kubeCfg.ContainerRuntimeEndpoint, kubeCfg.RuntimeRequestTimeout.Duration, 
+kubeDeps.TracerProvider); err != nil {
 		return err
 	}
-	if kubeDeps.RemoteImageService, err = remote.NewRemoteImageService(remoteImageEndpoint, kubeCfg.RuntimeRequestTimeout.Duration, kubeDeps.TracerProvider); err != nil {
+	if kubeDeps.RemoteImageService, err = remote.NewRemoteImageService(remoteImageEndpoint, kubeCfg.RuntimeRequestTimeout.Duration,
+kubeDeps.TracerProvider); err != nil {
 		return err
 	}
 
