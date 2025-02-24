@@ -3,9 +3,13 @@ kubelet 处理pod的主要函数：syncPod syncTerminatingPod，syncTerminatedPo
 
 https://github.com/kubernetes/kubernetes/tree/master/pkg/kubelet/kubelet.go
 
-func (kl *Kubelet) syncPod(_ context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (isTerminal bool, err error) {}
+func (kl *Kubelet) syncPod(_ context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) 
+(isTerminal bool, err error) {}
 
-syncPod 是用于同步单个 pod（设置）pod 的事务脚本。 此方法是可重入的，预计会将 pod 收敛到规范的所需状态。 反向操作（拆卸）在syncTerminatePod 和syncTermminatePod 中处理。 如果syncPod退出且没有错误，则Pod运行时状态与所需的配置状态同步（Pod正在运行）。 如果syncPod 因暂时性错误而退出，则下次调用syncPod 预计将取得进展以达到运行时状态。 当检测到 pod 由于容器退出（对于 RestartNever 或 RestartOnFailure）而达到终端生命周期阶段时，syncPod 会以 isTerminal 退出，并且syncTerminatePod 将调用下一个方法。
+syncPod 是用于同步单个 pod（设置）pod 的事务脚本。 此方法是可重入的，预计会将 pod 收敛到规范的所需状态。 反向操作（拆卸）在syncTerminatePod 
+和syncTermminatePod 中处理。 如果syncPod退出且没有错误，则Pod运行时状态与所需的配置状态同步（Pod正在运行）。
+如果syncPod 因暂时性错误而退出，则下次调用syncPod 预计将取得进展以达到运行时状态。 当检测到 pod 由于容器退出（对于 RestartNever 或 RestartOnFailure）
+而达到终端生命周期阶段时，syncPod 会以 isTerminal 退出，并且syncTerminatePod 将调用下一个方法。
 入参：
 updateType - 无论这是创建（第一次）还是更新，都只能用于指标，因为此方法必须是可重入的
 pod - 正在设置的 pod
